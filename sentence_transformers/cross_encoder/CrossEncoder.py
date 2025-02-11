@@ -11,7 +11,12 @@ from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm.autonotebook import tqdm, trange
-from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, is_torch_npu_available
+from transformers import (
+    AutoConfig,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    is_torch_npu_available,
+)
 from transformers.tokenization_utils_base import BatchEncoding
 from transformers.utils import PushToHubMixin
 
@@ -150,7 +155,11 @@ class CrossEncoder(PushToHubMixin):
             labels.append(example.label)
 
         tokenized = self.tokenizer(
-            *texts, padding=True, truncation="longest_first", return_tensors="pt", max_length=self.max_length
+            *texts,
+            padding=True,
+            truncation="longest_first",
+            return_tensors="pt",
+            max_length=self.max_length,
         )
         labels = torch.tensor(labels, dtype=torch.float if self.config.num_labels == 1 else torch.long).to(
             self.model.device
@@ -169,7 +178,11 @@ class CrossEncoder(PushToHubMixin):
                 texts[idx].append(text.strip())
 
         tokenized = self.tokenizer(
-            *texts, padding=True, truncation="longest_first", return_tensors="pt", max_length=self.max_length
+            *texts,
+            padding=True,
+            truncation="longest_first",
+            return_tensors="pt",
+            max_length=self.max_length,
         )
 
         for name in tokenized:
@@ -177,12 +190,54 @@ class CrossEncoder(PushToHubMixin):
 
         return tokenized
 
+    def smart_batching_collate_listwise(self, batch, max_docs_per_query: int = None):
+        """
+        Collate function that ensures fixed batch sizes by padding document lists.
+
+        Args:
+            batch: List of (query, documents, labels) tuples
+            max_docs_per_query: Maximum number of documents per query. If None,
+                            will use the maximum in the current batch
+        Returns:
+            Tuple of (tokenized, labels)
+        """
+        if max_docs_per_query is None:
+            max_docs_per_query = max(len(docs) for _, docs, _ in batch)
+
+        queries = []
+        documents = []
+        labels = []
+
+        for query, docs, doc_labels in batch:
+            queries.extend([query] * max_docs_per_query)
+            documents.extend(docs)
+            labels.extend(doc_labels)
+
+        tokenized = self.tokenizer(
+            queries,
+            documents,
+            padding=True,
+            truncation="longest_first",
+            return_tensors="pt",
+            max_length=self.max_length,
+        )
+
+        labels = torch.tensor(labels, dtype=torch.float).to(self.model.device)
+
+        for name in tokenized:
+            tokenized[name] = tokenized[name].to(self.model.device)
+
+        return tokenized, labels
+
     def fit(
         self,
         train_dataloader: DataLoader,
         evaluator: SentenceEvaluator = None,
         epochs: int = 1,
         loss_fct=None,
+        collate_fn=None,
+        max_docs_per_query: int = None,
+        pad_value: int = -1,
         activation_fct=nn.Identity(),
         scheduler: str = "WarmupLinear",
         warmup_steps: int = 10000,
@@ -208,6 +263,9 @@ class CrossEncoder(PushToHubMixin):
             evaluator (SentenceEvaluator, optional): An evaluator (sentence_transformers.evaluation) evaluates the model performance during training on held-out dev data. It is used to determine the best model that is saved to disc. Defaults to None.
             epochs (int, optional): Number of epochs for training. Defaults to 1.
             loss_fct: Which loss function to use for training. If None, will use nn.BCEWithLogitsLoss() if self.config.num_labels == 1 else nn.CrossEntropyLoss(). Defaults to None.
+            collate_fn: Optional custom collate function. If None, uses default smart_batching_collate.
+            pad_value (int): Value to use for padding in listwise training. Should match the pad_value used in the loss function. Defaults to -1.
+            max_docs_per_query (int): Maximum number of documents per query for listwise training. Required only for listwise training. Defaults to None.
             activation_fct: Activation function applied on top of logits output of model.
             scheduler (str, optional): Learning rate scheduler. Available schedulers: constantlr, warmupconstant, warmuplinear, warmupcosine, warmupcosinewithhardrestarts. Defaults to "WarmupLinear".
             warmup_steps (int, optional): Behavior depends on the scheduler. For WarmupLinear (default), the learning rate is increased from o up to the maximal learning rate. After these many training steps, the learning rate is decreased linearly back to zero. Defaults to 10000.
@@ -224,7 +282,16 @@ class CrossEncoder(PushToHubMixin):
                 `score`, `epoch`, `steps`. Defaults to None.
             show_progress_bar (bool, optional): If True, output a tqdm progress bar. Defaults to True.
         """
-        train_dataloader.collate_fn = self.smart_batching_collate
+
+        if collate_fn is not None:
+            train_dataloader.collate_fn = collate_fn
+        elif max_docs_per_query is not None:
+            assert self.config.num_labels == 1, "Listwise training only supported for regression tasks."
+            train_dataloader.collate_fn = lambda batch: self.smart_batching_collate_listwise(
+                batch, max_docs_per_query=max_docs_per_query, pad_value=pad_value
+            )
+        else:
+            train_dataloader.collate_fn = self.smart_batching_collate
 
         if use_amp:
             if is_torch_npu_available():
@@ -247,14 +314,20 @@ class CrossEncoder(PushToHubMixin):
                 "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
                 "weight_decay": weight_decay,
             },
-            {"params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+            {
+                "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
         ]
 
         optimizer = optimizer_class(optimizer_grouped_parameters, **optimizer_params)
 
         if isinstance(scheduler, str):
             scheduler = SentenceTransformer._get_scheduler(
-                optimizer, scheduler=scheduler, warmup_steps=warmup_steps, t_total=num_train_steps
+                optimizer,
+                scheduler=scheduler,
+                warmup_steps=warmup_steps,
+                t_total=num_train_steps,
             )
 
         if loss_fct is None:
@@ -267,14 +340,24 @@ class CrossEncoder(PushToHubMixin):
             self.model.train()
 
             for features, labels in tqdm(
-                train_dataloader, desc="Iteration", smoothing=0.05, disable=not show_progress_bar
+                train_dataloader,
+                desc="Iteration",
+                smoothing=0.05,
+                disable=not show_progress_bar,
             ):
                 if use_amp:
                     with torch.autocast(device_type=self.model.device.type):
                         model_predictions = self.model(**features, return_dict=True)
                         logits = activation_fct(model_predictions.logits)
-                        if self.config.num_labels == 1:
-                            logits = logits.view(-1)
+
+                        if max_docs_per_query:
+                            batch_size = train_dataloader.batch_size
+                            logits = logits.view(batch_size, max_docs_per_query)
+                            labels = labels.view(batch_size, max_docs_per_query)
+                        else:
+                            if self.config.num_labels == 1:
+                                logits = logits.view(-1)
+
                         loss_value = loss_fct(logits, labels)
 
                     scale_before_step = scaler.get_scale()
@@ -288,8 +371,15 @@ class CrossEncoder(PushToHubMixin):
                 else:
                     model_predictions = self.model(**features, return_dict=True)
                     logits = activation_fct(model_predictions.logits)
-                    if self.config.num_labels == 1:
-                        logits = logits.view(-1)
+
+                    if max_docs_per_query:
+                        batch_size = train_dataloader.batch_size
+                        logits = logits.view(batch_size, max_docs_per_query)
+                        labels = labels.view(batch_size, max_docs_per_query)
+                    else:
+                        if self.config.num_labels == 1:
+                            logits = logits.view(-1)
+
                     loss_value = loss_fct(logits, labels)
                     loss_value.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
@@ -304,7 +394,12 @@ class CrossEncoder(PushToHubMixin):
 
                 if evaluator is not None and evaluation_steps > 0 and training_steps % evaluation_steps == 0:
                     self._eval_during_training(
-                        evaluator, output_path, save_best_model, epoch, training_steps, callback
+                        evaluator,
+                        output_path,
+                        save_best_model,
+                        epoch,
+                        training_steps,
+                        callback,
                     )
 
                     self.model.zero_grad()
@@ -329,7 +424,7 @@ class CrossEncoder(PushToHubMixin):
     @overload
     def predict(
         self,
-        sentences: list[tuple[str, str]] | list[list[str]] | tuple[str, str] | list[str],
+        sentences: (list[tuple[str, str]] | list[list[str]] | tuple[str, str] | list[str]),
         batch_size: int = ...,
         show_progress_bar: bool | None = ...,
         num_workers: int = ...,
@@ -342,7 +437,7 @@ class CrossEncoder(PushToHubMixin):
     @overload
     def predict(
         self,
-        sentences: list[tuple[str, str]] | list[list[str]] | tuple[str, str] | list[str],
+        sentences: (list[tuple[str, str]] | list[list[str]] | tuple[str, str] | list[str]),
         batch_size: int = ...,
         show_progress_bar: bool | None = ...,
         num_workers: int = ...,
@@ -367,7 +462,7 @@ class CrossEncoder(PushToHubMixin):
 
     def predict(
         self,
-        sentences: list[tuple[str, str]] | list[list[str]] | tuple[str, str] | list[str],
+        sentences: (list[tuple[str, str]] | list[list[str]] | tuple[str, str] | list[str]),
         batch_size: int = 32,
         show_progress_bar: bool | None = None,
         num_workers: int = 0,
