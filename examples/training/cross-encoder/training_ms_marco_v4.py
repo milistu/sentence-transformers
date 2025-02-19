@@ -6,13 +6,19 @@ from datasets import load_dataset
 from torch import nn
 
 from sentence_transformers.cross_encoder import CrossEncoder
-from sentence_transformers.cross_encoder.evaluation.CENanoBEIREvaluator import CENanoBEIREvaluator
-from sentence_transformers.cross_encoder.losses.BinaryCrossEntropyLoss import BinaryCrossEntropyLoss
+from sentence_transformers.cross_encoder.evaluation.CENanoBEIREvaluator import (
+    CENanoBEIREvaluator,
+)
+from sentence_transformers.cross_encoder.losses.BinaryCrossEntropyLoss import (
+    BinaryCrossEntropyLoss,
+)
 from sentence_transformers.cross_encoder.losses.CachedMultipleNegativesRankingLoss import (
     CachedMultipleNegativesRankingLoss,
 )
 from sentence_transformers.cross_encoder.trainer import CrossEncoderTrainer
-from sentence_transformers.cross_encoder.training_args import CrossEncoderTrainingArguments
+from sentence_transformers.cross_encoder.training_args import (
+    CrossEncoderTrainingArguments,
+)
 from sentence_transformers.training_args import BatchSamplers
 
 
@@ -22,7 +28,11 @@ def main():
     loss_name = "bce"
 
     # Set the log level to INFO to get more information
-    logging.basicConfig(format="%(asctime)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.INFO)
+    logging.basicConfig(
+        format="%(asctime)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.INFO,
+    )
 
     train_batch_size = 32
     num_epochs = 1
@@ -56,7 +66,9 @@ def main():
             if 1 not in passages_info["is_selected"]:
                 continue
             positive_idx = passages_info["is_selected"].index(1)
-            negatives = [idx for idx, is_selected in enumerate(passages_info["is_selected"]) if not is_selected][:5]
+            negatives = [idx for idx, is_selected in enumerate(passages_info["is_selected"]) if not is_selected][
+                :num_negatives
+            ]
 
             outputs["query"].append(query)
             outputs["positive"].append(passages_info["passage_text"][positive_idx])
@@ -106,7 +118,7 @@ def main():
         fp16=False,  # Set to False if you get an error that your GPU can't run on FP16
         bf16=True,  # Set to True if you have a GPU that supports BF16
         # MultipleNegativesRankingLoss benefits from no duplicate samples in a batch
-        batch_sampler=BatchSamplers.NO_DUPLICATES if loss_name == "cmnrl" else BatchSamplers.BATCH_SAMPLER,
+        batch_sampler=(BatchSamplers.NO_DUPLICATES if loss_name == "cmnrl" else BatchSamplers.BATCH_SAMPLER),
         load_best_model_at_end=True,
         metric_for_best_model="eval_NanoBEIR_mean_ndcg@10",
         # Optional tracking/debugging parameters:
