@@ -132,12 +132,22 @@ class CrossEncoderRerankingEvaluator(BaseEvaluator):
             self.samples = list(self.samples.values())
 
         self.csv_file = "CrossEncoderRerankingEvaluator" + ("_" + name if name else "") + f"_results_@{self.at_k}.csv"
-        self.csv_headers = ["epoch", "steps", "MAP", f"MRR@{self.at_k}", f"NDCG@{self.at_k}"]
+        self.csv_headers = [
+            "epoch",
+            "steps",
+            "MAP",
+            f"MRR@{self.at_k}",
+            f"NDCG@{self.at_k}",
+        ]
         self.write_csv = write_csv
         self.primary_metric = f"ndcg@{self.at_k}"
 
     def __call__(
-        self, model: CrossEncoder, output_path: str | None = None, epoch: int = -1, steps: int = -1
+        self,
+        model: CrossEncoder,
+        output_path: str | None = None,
+        epoch: int = -1,
+        steps: int = -1,
     ) -> dict[str, float]:
         if epoch != -1:
             if steps == -1:
@@ -159,6 +169,7 @@ class CrossEncoderRerankingEvaluator(BaseEvaluator):
 
         all_pairs = []  # flat list of [query, doc] pairs for model.predict()
         sample_metadata = []  # per-sample: (is_relevant, num_pairs, num_ignored_positives) or None if skipped
+        sample_queries_and_docs = []
 
         for instance in self.samples:
             if "query" not in instance:
@@ -207,14 +218,18 @@ class CrossEncoderRerankingEvaluator(BaseEvaluator):
 
             if sum(is_relevant) == 0:
                 sample_metadata.append(None)
+                sample_queries_and_docs.append(None)
                 continue
 
             num_ignored_positives = len(is_relevant) - len(docs)
             sample_metadata.append((is_relevant, len(docs), num_ignored_positives))
+            sample_queries_and_docs.append((query, docs))
             all_pairs.extend([query, doc] for doc in docs)
 
-        # Single batched predict call for all query-document pairs
-        if all_pairs:
+        # Score all query-document pairs
+        if getattr(model, "_reranking_mode", "pointwise") == "listwise":
+            all_pred_scores = None  # listwise scores computed per-sample below
+        elif all_pairs:
             all_pred_scores = model.predict(
                 all_pairs,
                 prompt_name=self.prompt_name,
@@ -230,8 +245,9 @@ class CrossEncoderRerankingEvaluator(BaseEvaluator):
         all_ndcg_scores = []
         all_ap_scores = []
         score_offset = 0
+        listwise = getattr(model, "_reranking_mode", "pointwise") == "listwise"
 
-        for meta in sample_metadata:
+        for idx, meta in enumerate(sample_metadata):
             if meta is None:
                 all_mrr_scores.append(0)
                 all_ndcg_scores.append(0)
@@ -239,8 +255,16 @@ class CrossEncoderRerankingEvaluator(BaseEvaluator):
                 continue
 
             is_relevant, num_pairs, num_ignored_positives = meta
-            pred_scores = all_pred_scores[score_offset : score_offset + num_pairs]
-            score_offset += num_pairs
+
+            if listwise:
+                query, docs = sample_queries_and_docs[idx]
+                ranked = model.rank(query, docs, prompt_name=self.prompt_name, convert_to_numpy=True)
+                pred_scores = np.zeros(len(docs))
+                for item in ranked:
+                    pred_scores[item["corpus_id"]] = item["score"]
+            else:
+                pred_scores = all_pred_scores[score_offset : score_offset + num_pairs]
+                score_offset += num_pairs
 
             if num_ignored_positives:
                 pred_scores = np.concatenate([pred_scores, np.zeros(num_ignored_positives)])

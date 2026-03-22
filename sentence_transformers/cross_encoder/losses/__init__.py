@@ -13,6 +13,7 @@ from .lambda_loss import (
 )
 from .list_mle import ListMLELoss
 from .list_net import ListNetLoss
+from .listwise_generative_loss import ListwiseGenerativeLoss
 from .margin_mse import MarginMSELoss
 from .mse import MSELoss
 from .multiple_negatives_ranking import MultipleNegativesRankingLoss
@@ -37,4 +38,5 @@ __all__ = [
     "LambdaRankScheme",
     "NDCGLoss2PPScheme",
     "RankNetLoss",
+    "ListwiseGenerativeLoss",
 ]
