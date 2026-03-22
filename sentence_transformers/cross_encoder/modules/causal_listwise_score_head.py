@@ -4,6 +4,9 @@ import torch
 
 from sentence_transformers.base.modules import Module
 
+LISTWISE_DOC_IDS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+MAX_LISTWISE_DOCS = len(LISTWISE_DOC_IDS)
+
 
 class CausalListwiseScoreHead(Module):
     config_keys = ["doc_id_token_ids"]
