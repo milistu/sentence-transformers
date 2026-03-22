@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .causal_listwise_score_head import CausalListwiseScoreHead
 from .causal_score_head import CausalScoreHead
 
-__all__ = ["CausalScoreHead"]
+__all__ = ["CausalScoreHead", "CausalListwiseScoreHead"]
