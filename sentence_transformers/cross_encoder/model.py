@@ -12,7 +12,13 @@ import numpy as np
 import torch
 from torch import nn
 from tqdm.autonotebook import trange
-from transformers import AutoConfig, PretrainedConfig, PreTrainedModel, is_datasets_available
+from transformers import (
+    AutoConfig,
+    PretrainedConfig,
+    PreTrainedModel,
+    is_datasets_available,
+)
+from transformers.processing_utils import ProcessorMixin
 from transformers.utils import logging as transformers_logging
 from typing_extensions import deprecated
 
@@ -21,7 +27,12 @@ from sentence_transformers.base.model import BaseModel
 from sentence_transformers.base.modules import Transformer
 from sentence_transformers.cross_encoder.fit_mixin import FitMixin
 from sentence_transformers.cross_encoder.model_card import CrossEncoderModelCardData
-from sentence_transformers.cross_encoder.modules.causal_score_head import CausalScoreHead
+from sentence_transformers.cross_encoder.modules.causal_listwise_score_head import (
+    CausalListwiseScoreHead,
+)
+from sentence_transformers.cross_encoder.modules.causal_score_head import (
+    CausalScoreHead,
+)
 from sentence_transformers.util import batch_to_device, fullname, import_from_string
 from sentence_transformers.util.decorators import (
     cross_encoder_init_args_decorator,
@@ -164,6 +175,7 @@ class CrossEncoder(BaseModel, FitMixin):
         num_labels: int | None = None,
         max_length: int | None = None,
         activation_fn: Callable | None = None,
+        reranking_mode: Literal["pointwise", "listwise"] = "pointwise",
     ) -> None:
         # Set before super().__init__() so _parse_model_config can check these
         self.activation_fn = None
@@ -177,6 +189,8 @@ class CrossEncoder(BaseModel, FitMixin):
             if processor_kwargs is None:
                 processor_kwargs = {}
             processor_kwargs["model_max_length"] = max_length
+
+        self._reranking_mode = reranking_mode
 
         super().__init__(
             model_name_or_path=model_name_or_path,
@@ -238,7 +252,10 @@ class CrossEncoder(BaseModel, FitMixin):
         if (
             hasattr(config, "architectures")
             and config.architectures is not None
-            and config.architectures[0].endswith("ForCausalLM")
+            and (
+                config.architectures[0].endswith("ForCausalLM")
+                or config.architectures[0].endswith("ForConditionalGeneration")
+            )
         ):
             transformer_model = Transformer(
                 model_name_or_path,
@@ -249,10 +266,17 @@ class CrossEncoder(BaseModel, FitMixin):
                 config_kwargs=config_kwargs,
                 backend=self.backend,
             )
-            post_processing = CausalScoreHead(
-                true_token_id=transformer_model.tokenizer.convert_tokens_to_ids("yes"),
-                false_token_id=transformer_model.tokenizer.convert_tokens_to_ids("no"),
-            )
+            if self._reranking_mode == "listwise":
+                post_processing = CausalListwiseScoreHead(
+                    doc_id_token_ids=[
+                        transformer_model.tokenizer.convert_tokens_to_ids(c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                    ]
+                )
+            else:
+                post_processing = CausalScoreHead(
+                    true_token_id=transformer_model.tokenizer.convert_tokens_to_ids("yes"),
+                    false_token_id=transformer_model.tokenizer.convert_tokens_to_ids("no"),
+                )
             return [transformer_model, post_processing], {}
 
         # Otherwise, assume sequence-classification
@@ -363,7 +387,7 @@ class CrossEncoder(BaseModel, FitMixin):
                     scores = np.asarray(scores)
                 elif isinstance(scores, list):
                     scores = [
-                        score.cpu() if isinstance(score, torch.Tensor) and score.device.type != "cpu" else score
+                        (score.cpu() if isinstance(score, torch.Tensor) and score.device.type != "cpu" else score)
                         for score in scores
                     ]
                 results_queue.put([chunk_id, scores])
@@ -424,7 +448,7 @@ class CrossEncoder(BaseModel, FitMixin):
         for module in reversed(self):
             if isinstance(module, Transformer):
                 return module.model.config.num_labels
-            if isinstance(module, CausalScoreHead):
+            if isinstance(module, (CausalScoreHead, CausalListwiseScoreHead)):
                 return module.num_labels
         # Default to 1, not commonly reached
         return 1
@@ -654,7 +678,13 @@ class CrossEncoder(BaseModel, FitMixin):
         if self._uses_flattened_inputs():
             length_sorted_idx = self._interleave_sorted_indices(length_sorted_idx)
         inputs_sorted = [inputs[idx] for idx in length_sorted_idx]
-        for start_index in trange(0, len(inputs_sorted), batch_size, desc="Batches", disable=not show_progress_bar):
+        for start_index in trange(
+            0,
+            len(inputs_sorted),
+            batch_size,
+            desc="Batches",
+            disable=not show_progress_bar,
+        ):
             batch = inputs_sorted[start_index : start_index + batch_size]
             features = self.preprocess(batch, prompt=prompt, **kwargs)
             features = batch_to_device(features, device)
@@ -785,6 +815,18 @@ class CrossEncoder(BaseModel, FitMixin):
                 "CrossEncoder.rank() only works for models with num_labels=1. "
                 "Consider using CrossEncoder.predict() with input pairs instead."
             )
+
+        if isinstance(self[-1], CausalListwiseScoreHead):
+            return self._rank_listwise(
+                query=query,
+                documents=documents,
+                top_k=top_k,
+                return_documents=return_documents,
+                prompt_name=prompt_name,
+                prompt=prompt,
+                device=device,
+            )
+
         query_doc_pairs: list[PairInput] = [[query, doc] for doc in documents]
         scores = self.predict(
             inputs=query_doc_pairs,
@@ -810,6 +852,69 @@ class CrossEncoder(BaseModel, FitMixin):
         results = sorted(results, key=lambda x: x["score"], reverse=True)
         return results[:top_k]
 
+    def _rank_listwise(
+        self,
+        query: PairableInput,
+        documents: list[PairableInput],
+        top_k: int | None = None,
+        return_documents: bool = False,
+        prompt_name: str | None = None,
+        prompt: str | None = None,
+        device: str | torch.device | None = None,
+    ) -> list[dict[Literal["corpus_id", "score", "text"], int | float | str]]:
+        # TODO: make this global, the tokens that we used for ids
+        # What to do when we have more than 26 documents?
+        # How do we rank them all to have meaningful results that can be merged together?
+        if len(documents) > 26:
+            raise ValueError(
+                f"CausalListwiseScoreHead supports at most 26 documents, but got {len(documents)}. "
+                "Consider chunking your documents into windows of 26."
+            )
+
+        if device is None:
+            device = self.model.device
+        self.to(device)
+
+        prompt = self._resolve_prompt(prompt, prompt_name)
+
+        if prompt is None:
+            prompt = "Given a query and a set of documents, output the letter of the most relevant document."
+
+        letters = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")[: len(documents)]
+        docs_text = "\n\n".join([f"Document {letter}: {doc}" for letter, doc in zip(letters, documents)])
+        user_content = f"Query: {query}\n\n{docs_text}"
+
+        # Multimodal processors (ProcessorMixin) require content as a list of typed parts;
+        # plain tokenizers expect a string. Detect which format to use.
+        if isinstance(self[0].processor, ProcessorMixin):
+            content = lambda text: [{"type": "text", "text": text}]
+        else:
+            content = lambda text: text
+
+        message = [
+            {"role": "system", "content": content(prompt)},
+            {"role": "user", "content": content(user_content)},
+        ]
+
+        self.eval()
+        with torch.inference_mode():
+            features = self.preprocess([message])
+            features = batch_to_device(features, device)
+            features["num_docs"] = len(documents)
+            out_features = self.forward(features)
+
+        scores = out_features["scores"][0]  # shape: (num_docs,)
+
+        results = []
+        for i, score in enumerate(scores):
+            result = {"corpus_id": i, "score": score.item()}
+            if return_documents:
+                result["text"] = documents[i]
+            results.append(result)
+
+        results = sorted(results, key=lambda x: x["score"], reverse=True)
+        return results[:top_k]
+
     def is_singular_input(self, inputs: PairInput | list[PairInput]) -> bool:
         """
         Check if the input represents a single example or a batch of examples.
@@ -829,10 +934,13 @@ class CrossEncoder(BaseModel, FitMixin):
     def _get_model_config(self) -> dict[str, Any]:
         return super()._get_model_config() | {
             "activation_fn": fullname(self.activation_fn),
+            "reranking_mode": self._reranking_mode,
         }
 
     def _parse_model_config(self, model_config: dict[str, Any]) -> None:
         super()._parse_model_config(model_config)
+        if "reranking_mode" in model_config:
+            self._reranking_mode = model_config["reranking_mode"]
         if "activation_fn" in model_config:
             activation_fn_path = model_config["activation_fn"]
             if activation_fn_path is not None:
