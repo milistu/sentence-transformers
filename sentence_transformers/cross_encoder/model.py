@@ -18,7 +18,6 @@ from transformers import (
     PreTrainedModel,
     is_datasets_available,
 )
-from transformers.processing_utils import ProcessorMixin
 from transformers.utils import logging as transformers_logging
 from typing_extensions import deprecated
 
@@ -28,6 +27,8 @@ from sentence_transformers.base.modules import Transformer
 from sentence_transformers.cross_encoder.fit_mixin import FitMixin
 from sentence_transformers.cross_encoder.model_card import CrossEncoderModelCardData
 from sentence_transformers.cross_encoder.modules.causal_listwise_score_head import (
+    LISTWISE_DOC_IDS,
+    MAX_LISTWISE_DOCS,
     CausalListwiseScoreHead,
 )
 from sentence_transformers.cross_encoder.modules.causal_score_head import (
@@ -268,9 +269,7 @@ class CrossEncoder(BaseModel, FitMixin):
             )
             if self._reranking_mode == "listwise":
                 post_processing = CausalListwiseScoreHead(
-                    doc_id_token_ids=[
-                        transformer_model.tokenizer.convert_tokens_to_ids(c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                    ]
+                    doc_id_token_ids=[transformer_model.tokenizer.convert_tokens_to_ids(c) for c in LISTWISE_DOC_IDS]
                 )
             else:
                 post_processing = CausalScoreHead(
@@ -865,10 +864,10 @@ class CrossEncoder(BaseModel, FitMixin):
         # TODO: make this global, the tokens that we used for ids
         # What to do when we have more than 26 documents?
         # How do we rank them all to have meaningful results that can be merged together?
-        if len(documents) > 26:
+        if len(documents) > MAX_LISTWISE_DOCS:
             raise ValueError(
-                f"CausalListwiseScoreHead supports at most 26 documents, but got {len(documents)}. "
-                "Consider chunking your documents into windows of 26."
+                f"CausalListwiseScoreHead supports at most {MAX_LISTWISE_DOCS} documents, but got {len(documents)}. "
+                f"Consider chunking your documents into windows of {MAX_LISTWISE_DOCS}."
             )
 
         if device is None:
@@ -876,25 +875,14 @@ class CrossEncoder(BaseModel, FitMixin):
         self.to(device)
 
         prompt = self._resolve_prompt(prompt, prompt_name)
+        letters = LISTWISE_DOC_IDS[: len(documents)]
 
-        if prompt is None:
-            prompt = "Given a query and a set of documents, output the letter of the most relevant document."
-
-        letters = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")[: len(documents)]
-        docs_text = "\n\n".join([f"Document {letter}: {doc}" for letter, doc in zip(letters, documents)])
-        user_content = f"Query: {query}\n\n{docs_text}"
-
-        # Multimodal processors (ProcessorMixin) require content as a list of typed parts;
-        # plain tokenizers expect a string. Detect which format to use.
-        if isinstance(self[0].processor, ProcessorMixin):
-            content = lambda text: [{"type": "text", "text": text}]
-        else:
-            content = lambda text: text
-
-        message = [
-            {"role": "system", "content": content(prompt)},
-            {"role": "user", "content": content(user_content)},
-        ]
+        message = []
+        if prompt is not None:
+            message.append({"role": "system", "content": prompt})
+        message.append({"role": "query", "content": query})
+        for letter, doc in zip(letters, documents):
+            message.append({"role": f"document_{letter}", "content": doc})
 
         self.eval()
         with torch.inference_mode():
